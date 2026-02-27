@@ -1,0 +1,18 @@
+# Cache & results (auto-generated, machine-specific)
+results_cache.json
+machines.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# Diagnostic / temp scripts
+diagnose_log.py
+
+# OS
+.DS_Store
+Thumbs.db
