@@ -9,14 +9,19 @@ Two modes:
                          fraction-by-fraction logs.
 """
 
+import io
 import json
 import os
 import re
 import tempfile
 import time
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")          # headless – no GUI window
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -542,12 +547,22 @@ def render_deep_dive(tlog_path: str | None = None, uploaded_file=None,
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
-def sidebar() -> str:
+def sidebar() -> tuple[str, str]:
     with st.sidebar:
-        st.markdown("## ⚛️ Trajectory Log Analyzer")
+        st.markdown("## ⚛️ Linac QA Suite")
         st.divider()
-        mode = st.radio("**Mode**", ["📂 Manual Upload", "📡 Folder Scan"], index=0)
+
+        module = st.radio(
+            "**Module**",
+            ["📊 Trajectory Logs", "🔲 Picket Fence",
+             "🎯 Winston-Lutz",   "🔬 CBCT (CatPhan)"],
+            index=0)
         st.divider()
+
+        mode = "📂 Manual Upload"   # default; only used for Trajectory Logs
+        if module == "📊 Trajectory Logs":
+            mode = st.radio("**Mode**", ["📂 Manual Upload", "📡 Folder Scan"], index=0)
+            st.divider()
 
         if mode == "📡 Folder Scan":
             st.markdown("### 🏥 Machine Configuration")
@@ -586,7 +601,7 @@ def sidebar() -> str:
         st.divider()
         st.caption("Powered by pylinac & Streamlit")
 
-    return mode
+    return module, mode
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -938,23 +953,520 @@ def folder_scan_mode():
             render_deep_dive(tlog_path=chosen_frac_file, label=f"Patient {sel_pid} – {sel_frac}")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# SHARED HELPER — ZIP extractor (used by WL and CBCT modules)
+# ═════════════════════════════════════════════════════════════════════════════
+def extract_zip_to_tmpdir(uploaded_zip) -> str:
+    """
+    Write the uploaded ZIP to a temp file, extract all contents into a
+    temporary directory, and return the directory path.
+    The caller is responsible for cleaning up (shutil.rmtree) if needed.
+    """
+    import shutil
+    tmp_dir = tempfile.mkdtemp(prefix="pylinac_")
+    try:
+        zip_bytes = uploaded_zip.read()
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as ztmp:
+            ztmp.write(zip_bytes)
+            zip_path = ztmp.name
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmp_dir)
+        os.unlink(zip_path)
+        return tmp_dir
+    except Exception:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+
+def mpl_fig_to_bytes(fig) -> bytes:
+    """Render a matplotlib figure to PNG bytes."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+    buf.seek(0)
+    return buf.read()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE 2 — PICKET FENCE
+# ═════════════════════════════════════════════════════════════════════════════
+def picket_fence_module():
+    from pylinac import PicketFence
+
+    st.markdown(
+        "<h1 style='text-align:center'>🔲 Picket Fence QA</h1>"
+        "<p style='text-align:center;color:#8b949e'>MLC leaf positioning accuracy "
+        "— upload a single EPID DICOM image</p>",
+        unsafe_allow_html=True)
+    st.divider()
+
+    # ── Demo or upload ────────────────────────────────────────────────────
+    use_demo = st.checkbox(
+        "🧪 Use pylinac demo image",
+        help="Loads the built-in picket fence demo image from pylinac. "
+             "Files are downloaded once from the internet and then cached locally.")
+
+    uploaded = None
+    if not use_demo:
+        uploaded = st.file_uploader(
+            "📂 Upload EPID DICOM image (.dcm)",
+            type=["dcm"],
+            help="Single-image EPID acquisition of the picket fence field.")
+        if uploaded is None:
+            st.info("👆 Upload a **.dcm** EPID picket fence image, or tick **Use pylinac demo image** above.",
+                    icon="ℹ️")
+            st.stop()
+
+    # ── Controls ──────────────────────────────────────────────────────────
+    col_tol, col_act = st.columns(2)
+    tolerance = col_tol.slider(
+        "Tolerance (mm)", min_value=0.1, max_value=0.5,
+        value=0.5, step=0.05,
+        help="Maximum allowed MLC leaf positioning error.")
+    action_tolerance = col_act.slider(
+        "Action Tolerance (mm)", min_value=0.1, max_value=float(tolerance),
+        value=min(0.25, float(tolerance)), step=0.05,
+        help="Leaves exceeding this but below tolerance are flagged as warnings.")
+
+    # ── Analyse ───────────────────────────────────────────────────────────
+    with st.spinner("🔍 Analysing picket fence image…"):
+        try:
+            if use_demo:
+                pf = PicketFence.from_demo_image()
+            else:
+                tmp_path = None
+                with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as tmp:
+                    tmp.write(uploaded.read())
+                    tmp_path = tmp.name
+                pf = PicketFence(tmp_path)
+            pf.analyze(
+                tolerance=tolerance,
+                action_tolerance=action_tolerance,
+            )
+        except Exception as exc:
+            st.error(f"❌ Analysis failed: {exc}")
+            st.stop()
+        finally:
+            if not use_demo and tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    # ── Results text ──────────────────────────────────────────────────────
+    try:
+        rd = pf.results_data()
+        passed    = getattr(rd, "percent_passing", None)
+        med_err   = getattr(rd, "median_error",    getattr(rd, "absolute_median_error", None))
+        max_err   = getattr(rd, "max_error",        None)
+        n_pickets = getattr(rd, "number_of_pickets", None)
+    except Exception:
+        passed = med_err = max_err = n_pickets = None
+
+    overall_pass = (passed is not None and passed == 100.0) or pf.passed
+    status_icon  = "✅ PASS" if overall_pass else "❌ FAIL"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(metric_card("Result",          status_icon),                                         unsafe_allow_html=True)
+    c2.markdown(metric_card("% Passing",       f"{passed:.1f} %" if passed is not None else "N/A"),  unsafe_allow_html=True)
+    c3.markdown(metric_card("Median Error",    f"{med_err:.3f} mm" if med_err is not None else "N/A"), unsafe_allow_html=True)
+    c4.markdown(metric_card("Max Error",       f"{max_err:.3f} mm" if max_err is not None else "N/A"), unsafe_allow_html=True)
+
+    if not overall_pass:
+        st.error("❌ One or more leaves exceeded the tolerance. Review the overlay below.")
+    else:
+        st.success("✅ All leaves within tolerance.")
+
+    st.divider()
+
+    # ── Analysed image ────────────────────────────────────────────────────
+    st.markdown("### 🖼️ Analysed Image (Pass/Fail Overlay)")
+    try:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        pf.plot_analyzed_image(ax=ax, show=False)
+        st.image(mpl_fig_to_bytes(fig), use_container_width=True)
+        plt.close(fig)
+    except Exception:
+        # Fallback: save_analyzed_image → BytesIO
+        try:
+            buf = io.BytesIO()
+            pf.save_analyzed_image(buf)
+            buf.seek(0)
+            st.image(buf.read(), use_container_width=True)
+        except Exception as exc2:
+            st.warning(f"Could not render overlay image: {exc2}")
+
+    st.divider()
+
+    # ── Per-picket / worst-leaf table ─────────────────────────────────────
+    st.markdown("### 📋 Worst-Performing Leaves")
+    try:
+        leaf_rows = []
+        for i, picket in enumerate(pf.pickets):
+            for j, leaf in enumerate(picket.leaves):
+                err = abs(getattr(leaf, "error", getattr(leaf, "passed_error", 0)))
+                passed_leaf = getattr(leaf, "passed", True)
+                leaf_rows.append({
+                    "Picket": i + 1,
+                    "Leaf #": j + 1,
+                    "Error (mm)": round(float(err), 4),
+                    "Status": "✅" if passed_leaf else "❌",
+                })
+        if leaf_rows:
+            ldf = (pd.DataFrame(leaf_rows)
+                   .sort_values("Error (mm)", ascending=False)
+                   .head(20))
+            st.dataframe(
+                ldf.style.background_gradient(subset=["Error (mm)"], cmap="RdYlGn_r"),
+                use_container_width=True)
+        else:
+            raise ValueError("No leaf data")
+    except Exception:
+        # Graceful fallback: show text summary
+        try:
+            st.text(pf.results())
+        except Exception:
+            st.info("Leaf-level detail not available for this pylinac version.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE 3 — WINSTON-LUTZ
+# ═════════════════════════════════════════════════════════════════════════════
+def winston_lutz_module():
+    import shutil
+    from pylinac import WinstonLutz
+
+    st.markdown(
+        "<h1 style='text-align:center'>🎯 Winston-Lutz Isocenter QA</h1>"
+        "<p style='text-align:center;color:#8b949e'>Upload a ZIP of EPID DICOM images "
+        "acquired at multiple gantry/collimator/couch angles</p>",
+        unsafe_allow_html=True)
+    st.divider()
+
+    # ── Demo or upload ────────────────────────────────────────────────────
+    use_demo = st.checkbox(
+        "🧪 Use pylinac demo images",
+        help="Downloads the built-in Winston-Lutz demo dataset from pylinac. "
+             "Requires internet access on first use; cached locally afterwards.")
+
+    uploaded = None
+    if not use_demo:
+        uploaded = st.file_uploader(
+            "📂 Upload ZIP of EPID DICOM images",
+            type=["zip"],
+            help="ZIP file containing DICOM images from the Winston-Lutz acquisition sequence.")
+        if uploaded is None:
+            st.info("👆 Upload a **.zip** file containing WL DICOM images, "
+                    "or tick **Use pylinac demo images** above.", icon="ℹ️")
+            st.stop()
+
+    # ── Extract & analyse ─────────────────────────────────────────────────
+    tmp_dir = None
+    with st.spinner("📦 Extracting ZIP and analysing isocenter…"):
+        try:
+            if use_demo:
+                wl = WinstonLutz.from_demo_images()
+            else:
+                tmp_dir = extract_zip_to_tmpdir(uploaded)
+                wl = WinstonLutz(tmp_dir)
+            wl.analyze()
+        except Exception as exc:
+            st.error(f"❌ Analysis failed: {exc}")
+            st.stop()
+
+    # ── Summary metrics ───────────────────────────────────────────────────
+    try:
+        rd = wl.results_data()
+        max_3d   = getattr(rd, "max_2d_cax_to_bb_mm",
+                   getattr(rd, "gantry_3d_iso_diameter",
+                   getattr(rd, "max_3d_cax_to_bb_mm", None)))
+        mean_2d  = getattr(rd, "mean_2d_cax_to_bb_mm",
+                   getattr(rd, "mean_2d_field_to_cax_offset", None))
+        n_imgs   = getattr(rd, "num_total_images", None)
+        iso_diam = getattr(rd, "gantry_3d_iso_diameter", max_3d)
+    except Exception:
+        max_3d = mean_2d = n_imgs = iso_diam = None
+
+    CLINICAL_ISO_LIMIT = 1.0   # mm
+    iso_val  = iso_diam if iso_diam is not None else max_3d
+    iso_pass = iso_val is not None and iso_val <= CLINICAL_ISO_LIMIT
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.markdown(metric_card("Result",           "✅ PASS" if iso_pass else "❌ REVIEW"),               unsafe_allow_html=True)
+    c2.markdown(metric_card("3D Iso Diameter",  f"{iso_val:.3f} mm" if iso_val is not None else "N/A"), unsafe_allow_html=True)
+    c3.markdown(metric_card("Mean 2D offset",   f"{mean_2d:.3f} mm" if mean_2d is not None else "N/A"), unsafe_allow_html=True)
+    c4.markdown(metric_card("Images analysed",  str(n_imgs) if n_imgs is not None else "N/A"),           unsafe_allow_html=True)
+
+    if not iso_pass:
+        st.warning(
+            f"⚠️ Isocenter diameter ({iso_val:.3f} mm) exceeds the {CLINICAL_ISO_LIMIT} mm clinical limit. "
+            "Review couch, collimator and gantry star shots.", icon="🔴")
+    else:
+        st.success("✅ Isocenter within 1 mm clinical tolerance.")
+
+    st.divider()
+
+    # ── Pylinac summary plot ──────────────────────────────────────────────
+    st.markdown("### 🖼️ Summary Plot")
+    try:
+        fig = wl.plot_summary(show=False)
+        st.image(mpl_fig_to_bytes(fig), use_container_width=True)
+        plt.close(fig)
+    except Exception:
+        try:
+            buf = io.BytesIO()
+            wl.save_summary_plot(buf)
+            buf.seek(0)
+            st.image(buf.read(), use_container_width=True)
+        except Exception as exc2:
+            st.warning(f"Could not render summary plot: {exc2}")
+
+    st.divider()
+
+    # ── 3-D scatter plot of isocenter offsets ────────────────────────────
+    st.markdown("### 🌐 3-D Isocenter Scatter")
+    try:
+        # Collect per-image offsets
+        rows_3d = []
+        for img in wl.images:
+            try:
+                rows_3d.append({
+                    "x": float(getattr(img, "cax2bb_vector", [0,0,0])[0]),
+                    "y": float(getattr(img, "cax2bb_vector", [0,0,0])[1]),
+                    "z": float(getattr(img, "cax2bb_vector", [0,0,0])[2])
+                    if len(getattr(img, "cax2bb_vector", [])) > 2 else 0.0,
+                    "gantry":      getattr(img, "gantry_angle", 0),
+                    "collimator":  getattr(img, "collimator_angle", 0),
+                })
+            except Exception:
+                continue
+        if rows_3d:
+            df3 = pd.DataFrame(rows_3d)
+            fig3 = go.Figure(go.Scatter3d(
+                x=df3["x"], y=df3["y"], z=df3["z"],
+                mode="markers",
+                marker=dict(size=6, color=df3["gantry"],
+                            colorscale="Plasma", showscale=True,
+                            colorbar=dict(title="Gantry°")),
+                text=[f"G{r['gantry']:.0f}° C{r['collimator']:.0f}°"
+                      for _, r in df3.iterrows()]))
+            fig3.add_trace(go.Scatter3d(
+                x=[0], y=[0], z=[0], mode="markers",
+                marker=dict(size=10, color="#f78166", symbol="cross"),
+                name="Nominal iso"))
+            fig3.update_layout(
+                scene=dict(
+                    xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Z (mm)",
+                    bgcolor="#0d1117",
+                    xaxis=dict(backgroundcolor="#161b22", gridcolor="#30363d"),
+                    yaxis=dict(backgroundcolor="#161b22", gridcolor="#30363d"),
+                    zaxis=dict(backgroundcolor="#161b22", gridcolor="#30363d"),
+                ),
+                paper_bgcolor="#0d1117", font=dict(color="#e6edf3"),
+                title=dict(text="CAX→BB Vector per Image", font=dict(color="#58a6ff")))
+            st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("3-D vector data not available for this log set.")
+    except Exception as exc:
+        st.info(f"3-D plot unavailable: {exc}")
+
+    # cleanup
+    if tmp_dir:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MODULE 4 — CBCT CATPHAN ANALYSIS
+# ═════════════════════════════════════════════════════════════════════════════
+def cbct_module():
+    import shutil
+
+    st.markdown(
+        "<h1 style='text-align:center'>🔬 CBCT Analysis — CatPhan</h1>"
+        "<p style='text-align:center;color:#8b949e'>Upload a ZIP of CBCT DICOM slices "
+        "acquired with a CatPhan 504/600/503 phantom</p>",
+        unsafe_allow_html=True)
+    st.divider()
+
+    phantom_type = st.selectbox(
+        "CatPhan model",
+        ["CatPhan504", "CatPhan600", "CatPhan503", "CatPhan604"],
+        help="Select the phantom model that matches your physical phantom.")
+
+    # ── Demo or upload ────────────────────────────────────────────────────
+    use_demo = st.checkbox(
+        "🧪 Use pylinac demo images (CatPhan504)",
+        help="Downloads the built-in CatPhan504 demo dataset from pylinac. "
+             "Requires internet access on first use; cached locally afterwards.")
+
+    uploaded = None
+    if not use_demo:
+        uploaded = st.file_uploader(
+            "📂 Upload ZIP of CBCT DICOM slices",
+            type=["zip"],
+            help="ZIP file containing all CBCT DICOM slices from the CatPhan scan.")
+        if uploaded is None:
+            st.info("👆 Upload a **.zip** file containing the CBCT DICOM slices, "
+                    "or tick **Use pylinac demo images** above.", icon="ℹ️")
+            st.stop()
+
+    # ── Extract & analyse ─────────────────────────────────────────────────
+    tmp_dir = None
+    with st.spinner("📦 Extracting ZIP and analysing phantom…"):
+        try:
+            import pylinac.ct as pct
+            if use_demo:
+                # Demo is always CatPhan504 (the only one with a built-in demo)
+                cbct = pct.CatPhan504.from_demo_images()
+            else:
+                tmp_dir = extract_zip_to_tmpdir(uploaded)
+                CatPhanClass = getattr(pct, phantom_type)
+                cbct = CatPhanClass(tmp_dir)
+            cbct.analyze()
+        except AttributeError:
+            st.error(f"❌ Phantom model **{phantom_type}** not found in this pylinac version.")
+            st.stop()
+        except Exception as exc:
+            st.error(f"❌ Analysis failed: {exc}")
+            st.stop()
+
+    # ── Pull results ──────────────────────────────────────────────────────
+    try:
+        rd = cbct.results_data()
+    except Exception:
+        rd = None
+
+    def safe_get(obj, *attrs, default="N/A"):
+        """Try multiple attribute names, return first that exists."""
+        for attr in attrs:
+            try:
+                v = getattr(obj, attr, None)
+                if v is not None:
+                    return v
+            except Exception:
+                pass
+        return default
+
+    # ── Summary cards ─────────────────────────────────────────────────────
+    st.markdown("### 📊 Summary")
+
+    # HU Linearity
+    hu_r2   = safe_get(rd, "hu_linearity_r2", "catphan_hu_r2")
+    hu_pass = safe_get(rd, "hu_linearity_passed", "catphan_hu_passed")
+    # Uniformity
+    uni_idx = safe_get(rd, "uniformity_index", "catphan_uniformity", "uniformity")
+    uni_pass= safe_get(rd, "uniformity_passed")
+    # MTF / Resolution
+    mtf_50  = safe_get(rd, "mtf_50", "catphan_mtf_50", "mtf_lpmm_50")
+    # Geometry
+    geo_mean= safe_get(rd, "mean_high_contrast_distance_mm",
+                          "geometric_mean_diameter", "geometry_mean")
+    low_cnt = safe_get(rd, "num_low_contrast_objects_seen",
+                          "low_contrast_num_rois")
+
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(metric_card("HU Linearity R²",
+                            f"{hu_r2:.4f}" if isinstance(hu_r2, float) else str(hu_r2)),
+                unsafe_allow_html=True)
+    c2.markdown(metric_card("Uniformity Index",
+                            f"{uni_idx:.2f}" if isinstance(uni_idx, float) else str(uni_idx)),
+                unsafe_allow_html=True)
+    c3.markdown(metric_card("MTF 50% (lp/mm)",
+                            f"{mtf_50:.2f}" if isinstance(mtf_50, float) else str(mtf_50)),
+                unsafe_allow_html=True)
+    c4, c5 = st.columns(2)
+    c4.markdown(metric_card("Geometric Mean (mm)",
+                            f"{geo_mean:.3f}" if isinstance(geo_mean, float) else str(geo_mean)),
+                unsafe_allow_html=True)
+    c5.markdown(metric_card("Low Contrast Objects",
+                            str(low_cnt)), unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── HU Linearity Table ────────────────────────────────────────────────
+    st.markdown("### 📐 HU Linearity")
+    try:
+        hu_module = (getattr(cbct, "hu", None) or
+                     getattr(cbct, "catphan_hu", None) or
+                     getattr(cbct, "hus", None))
+        if hu_module is not None:
+            rois = getattr(hu_module, "rois", {})
+            if rois:
+                hu_rows = []
+                for name, roi in rois.items():
+                    hu_rows.append({
+                        "ROI":           name,
+                        "Measured HU":   round(float(getattr(roi, "pixel_value", 0)), 1),
+                        "Nominal HU":    round(float(getattr(roi, "nominal_val",  0)), 1),
+                        "Difference HU": round(float(getattr(roi, "pixel_value", 0))
+                                               - float(getattr(roi, "nominal_val", 0)), 1),
+                        "Pass":          "✅" if getattr(roi, "passed", True) else "❌",
+                    })
+                hu_df = pd.DataFrame(hu_rows)
+                st.dataframe(
+                    hu_df.style.background_gradient(
+                        subset=["Difference HU"], cmap="RdYlGn_r"),
+                    use_container_width=True)
+            else:
+                st.info("HU ROI data not exposed in this pylinac version.")
+        else:
+            st.info("HU module not found on this phantom type.")
+    except Exception as exc:
+        st.info(f"HU table unavailable: {exc}")
+
+    st.divider()
+
+    # ── Phantom images ────────────────────────────────────────────────────
+    st.markdown("### 🖼️ Phantom Analysis Images")
+    try:
+        img_dir = tempfile.mkdtemp(prefix="cbct_imgs_")
+        cbct.save_images(directory=img_dir)
+        import glob
+        imgs = sorted(glob.glob(os.path.join(img_dir, "*.png")))
+        if imgs:
+            cols = st.columns(min(len(imgs), 3))
+            for i, img_path in enumerate(imgs):
+                with open(img_path, "rb") as f:
+                    cols[i % 3].image(f.read(),
+                                      caption=Path(img_path).stem,
+                                      use_container_width=True)
+        else:
+            raise ValueError("No images saved")
+        shutil.rmtree(img_dir, ignore_errors=True)
+    except Exception:
+        # Fallback: use pylinac's plot methods module by module
+        try:
+            fig = plt.figure(figsize=(14, 10))
+            cbct.plot_images(show=False)
+            st.image(mpl_fig_to_bytes(plt.gcf()), use_container_width=True)
+            plt.close("all")
+        except Exception as exc2:
+            st.warning(f"Could not render phantom images: {exc2}")
+
+    # cleanup
+    if tmp_dir:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    st.markdown(
-        "<h1 style='text-align:center'>⚛️ Varian Trajectory Log Analyzer</h1>"
-        "<p style='text-align:center;color:#8b949e'>Department-wide MLC performance "
-        "monitoring — manual upload or automatic folder scan</p>",
-        unsafe_allow_html=True)
-    st.divider()
+    module, mode = sidebar()
 
-    mode = sidebar()
-
-    if mode == "📂 Manual Upload":
-        manual_upload_mode()
-    else:
-        folder_scan_mode()
+    if module == "📊 Trajectory Logs":
+        st.markdown(
+            "<h1 style='text-align:center'>⚛️ Varian Trajectory Log Analyzer</h1>"
+            "<p style='text-align:center;color:#8b949e'>Department-wide MLC performance "
+            "monitoring — manual upload or automatic folder scan</p>",
+            unsafe_allow_html=True)
+        st.divider()
+        if mode == "📂 Manual Upload":
+            manual_upload_mode()
+        else:
+            folder_scan_mode()
+    elif module == "🔲 Picket Fence":
+        picket_fence_module()
+    elif module == "🎯 Winston-Lutz":
+        winston_lutz_module()
+    elif module == "🔬 CBCT (CatPhan)":
+        cbct_module()
 
 
 if __name__ == "__main__":
