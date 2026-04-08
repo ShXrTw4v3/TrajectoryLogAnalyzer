@@ -1,7 +1,7 @@
 # ⚛️ Linac QA Suite
 
 A Streamlit web app for department-wide radiotherapy machine QA — built on **pylinac**.  
-Supports **Halcyon (ProNG)**, **TrueBeam**, **Ethos (OrlNG)**, and all standard Varian C-arm linacs.
+Supports **Halcyon**, **TrueBeam**, **Ethos, and all standard Varian C-arm linacs.
 
 ---
 
